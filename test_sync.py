@@ -127,42 +127,57 @@ def test_diff_new_reminder_added_to_obsidian():
     assert "New task" in names
 
 def test_diff_obsidian_checked_marks_reminder_complete():
-    """[ ] → [x] in Obsidian causes completed=True in merged output."""
-    state_items = [{"id": "r1", "name": "Task", "list": "Reminders", "completed": False, "modified": "2026-06-21T09:00:00"}]
-    reminders   = [{"id": "r1", "name": "Task", "list": "Reminders", "completed": False, "modified": "2026-06-21T09:00:00"}]
-    # User checked it off in Obsidian
+    """[ ] → [x] in Obsidian completes the reminder and shows it as completed."""
+    state_items = [{"id": "r1", "name": "Task", "list": "Reminders", "completed": False}]
+    reminders   = [{"id": "r1", "name": "Task", "list": "Reminders", "completed": False}]
     obsidian_sections = {"Completed": [{"name": "Task", "completed": True}]}
-    merged, _ = compute_diff(state_items, reminders, obsidian_sections)
+    merged, actions = compute_diff(state_items, reminders, obsidian_sections)
     task = next(i for i in merged if i["name"] == "Task")
     assert task["completed"] is True
+    assert "r1" in actions["complete"]
 
 def test_diff_new_obsidian_item_gets_created_in_reminders():
-    """New - [ ] line in an Obsidian section → appears in reminders_to_create."""
-    state_items = []
-    reminders   = []
+    """New - [ ] line in an Obsidian section → a create action for that list."""
     obsidian_sections = {"Personal": [{"name": "Buy milk", "completed": False}]}
-    _, actions = compute_diff(state_items, reminders, obsidian_sections)
-    creates = actions.get("create", [])
-    assert any(c["name"] == "Buy milk" and c["list"] == "Personal" for c in creates)
+    _, actions = compute_diff([], [], obsidian_sections)
+    assert any(c["name"] == "Buy milk" and c["list"] == "Personal" for c in actions["create"])
 
-def test_diff_reminder_deleted_removed_from_obsidian():
-    """Item in state but gone from Reminders → not in merged output."""
-    state_items = [{"id": "r1", "name": "Old task", "list": "Reminders", "completed": False, "modified": "2026-06-20T08:00:00"}]
-    reminders   = []  # deleted
+def test_diff_completed_on_phone_moves_to_completed_section():
+    """Open item that vanishes from Reminders (still [ ] in file) → shown completed."""
+    state_items = [{"id": "r1", "name": "Old task", "list": "Reminders", "completed": False}]
+    reminders   = []  # gone from the open set (completed/deleted on phone)
     obsidian_sections = {"Reminders": [{"name": "Old task", "completed": False}]}
     merged, _ = compute_diff(state_items, reminders, obsidian_sections)
-    names = [i["name"] for i in merged]
-    assert "Old task" not in names
+    task = next(i for i in merged if i["name"] == "Old task")
+    assert task["completed"] is True
 
-def test_diff_obsidian_unchecked_marks_reminder_incomplete():
-    """[x] → [ ] in Obsidian causes completed=False in merged output."""
-    state_items = [{"id": "r1", "name": "Task", "list": "Reminders", "completed": True, "modified": "2026-06-21T09:00:00"}]
-    reminders   = [{"id": "r1", "name": "Task", "list": "Reminders", "completed": True, "modified": "2026-06-21T09:00:00"}]
-    # User un-checked it in Obsidian
-    obsidian_sections = {"Reminders": [{"name": "Task", "completed": False}]}
+def test_diff_completed_line_deleted_clears_it():
+    """A completed item whose line is removed from the file is dropped entirely."""
+    state_items = [{"id": "r1", "name": "Done thing", "list": "Reminders", "completed": True}]
+    reminders   = []
+    obsidian_sections = {}  # user deleted the line
     merged, _ = compute_diff(state_items, reminders, obsidian_sections)
+    assert all(i["name"] != "Done thing" for i in merged)
+
+def test_diff_completed_item_persists_while_line_kept():
+    """A completed item keeps showing as long as its [x] line stays in the file."""
+    state_items = [{"id": "r1", "name": "Done thing", "list": "Reminders", "completed": True}]
+    reminders   = []
+    obsidian_sections = {"Completed": [{"name": "Done thing", "completed": True}]}
+    merged, actions = compute_diff(state_items, reminders, obsidian_sections)
+    task = next(i for i in merged if i["name"] == "Done thing")
+    assert task["completed"] is True
+    assert actions["complete"] == [] and actions["uncomplete"] == []
+
+def test_diff_obsidian_unchecked_reopens_completed_item():
+    """[x] → [ ] in Obsidian on a completed item → uncomplete action + shown open."""
+    state_items = [{"id": "r1", "name": "Task", "list": "Reminders", "completed": True}]
+    reminders   = []  # completed items aren't in the open fetch
+    obsidian_sections = {"Reminders": [{"name": "Task", "completed": False}]}
+    merged, actions = compute_diff(state_items, reminders, obsidian_sections)
     task = next(i for i in merged if i["name"] == "Task")
     assert task["completed"] is False
+    assert "r1" in actions["uncomplete"]
 
 
 # ---------------------------------------------------------------------------

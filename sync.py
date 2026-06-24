@@ -138,9 +138,10 @@ def should_abort(fetch_ok: bool, fetched_items: list, state_items: list):
     """
     if not fetch_ok:
         return True, "Reminders read failed"
-    if not fetched_items and state_items:
+    had_incomplete = any(not i.get("completed") for i in state_items)
+    if not fetched_items and had_incomplete:
         return True, (
-            f"fetch returned 0 items but state had {len(state_items)} "
+            "fetch returned 0 open reminders but state had open items "
             "— likely a Reminders permission failure under launchd"
         )
     return False, ""
@@ -152,51 +153,83 @@ def should_abort(fetch_ok: bool, fetched_items: list, state_items: list):
 
 def compute_diff(state_items: list, reminders: list, obsidian_sections: dict):
     """
-    Compute the merged item list and actions to apply back to Reminders.
+    Merge the three sources into the final item list + the actions to push back
+    to Reminders. Completion is tracked WITHOUT querying completed reminders
+    (which is far too slow over iCloud):
 
-    Returns:
-        merged   — final list of reminder dicts (Reminders side of truth)
-        actions  — {"create": [...], "complete": [...], "uncomplete": [...]}
+      - `reminders`  — fresh OPEN reminders from Reminders.app (real ids).
+      - `state_items`— last snapshot (open + completed), bridges name → id.
+      - obsidian     — the user's checkbox intent.
+
+    An item shows in '# Completed' when the user checks it in Obsidian, or when a
+    tracked open item disappears from Reminders (completed/deleted elsewhere).
+    Deleting its line from the file clears it.
+
+    Returns (merged, actions) where
+        actions = {"create": [...], "complete": [ids], "uncomplete": [ids]}
     """
-    state_by_id = {i["id"]: i for i in state_items}
-    state_names = {i["name"] for i in state_items}
-    reminder_names = {i["name"] for i in reminders}
+    state_by_name = {i["name"]: i for i in state_items}
+    incomplete = {r["name"]: r for r in reminders}
 
-    # Flatten Obsidian items: name → {completed, list}
-    obsidian_by_name = {}
+    obs = {}
     for section, items in obsidian_sections.items():
-        for item in items:
-            obsidian_by_name[item["name"]] = {
-                "completed": item["completed"],
+        for it in items:
+            obs[it["name"]] = {
+                "completed": it["completed"],
                 "list": None if section == "Completed" else section,
             }
 
     merged = []
     actions = {"create": [], "complete": [], "uncomplete": []}
+    handled = set()
 
-    for r in reminders:
-        item = dict(r)
-        if r["name"] in obsidian_by_name:
-            obs = obsidian_by_name[r["name"]]
-            state_item = state_by_id.get(r["id"])
-            state_completed = state_item["completed"] if state_item else r["completed"]
+    # 1) Open reminders — Reminders' truth for open items.
+    for name, r in incomplete.items():
+        handled.add(name)
+        o = obs.get(name)
+        if o and o["completed"]:
+            # Checked off in Obsidian → complete in Reminders, show as completed.
+            actions["complete"].append(r["id"])
+            merged.append({"id": r["id"], "name": name, "list": r["list"], "completed": True})
+        else:
+            merged.append({"id": r["id"], "name": name, "list": r["list"], "completed": False})
 
-            # Obsidian changed completion status → honour it
-            if obs["completed"] != state_completed:
-                item["completed"] = obs["completed"]
-                if obs["completed"]:
-                    actions["complete"].append(r["id"])
-                else:
-                    actions["uncomplete"].append(r["id"])
-        merged.append(item)
-
-    # New Obsidian items (unknown to state and not in Reminders) → create
-    for section, items in obsidian_sections.items():
-        if section == "Completed":
+    # 2) Tracked items that are no longer open in Reminders.
+    for st in state_items:
+        name = st["name"]
+        if name in handled:
             continue
-        for item in items:
-            if item["name"] not in state_names and item["name"] not in reminder_names:
-                actions["create"].append({"name": item["name"], "list": section})
+        handled.add(name)
+        o = obs.get(name)
+        was_completed = st.get("completed", False)
+        if o is None:
+            # Line removed from the file → clear it (open or completed).
+            continue
+        if o["completed"]:
+            # Marked [x] in the file → completed (just-checked or persisting).
+            merged.append({"id": st.get("id", ""), "name": name,
+                           "list": st.get("list", "Reminders"), "completed": True})
+        elif was_completed:
+            # Was completed, now [ ] in the file → user reopened it.
+            if st.get("id"):
+                actions["uncomplete"].append(st["id"])
+            merged.append({"id": st.get("id", ""), "name": name,
+                           "list": (o["list"] or st.get("list", "Reminders")), "completed": False})
+        else:
+            # Was open, still [ ] in the file, but gone from Reminders →
+            # completed/deleted elsewhere → show as completed.
+            merged.append({"id": st.get("id", ""), "name": name,
+                           "list": st.get("list", "Reminders"), "completed": True})
+
+    # 3) Brand-new lines typed in Obsidian.
+    for name, o in obs.items():
+        if name in handled:
+            continue
+        handled.add(name)
+        if o["completed"]:
+            merged.append({"id": "", "name": name, "list": o["list"] or "Reminders", "completed": True})
+        else:
+            actions["create"].append({"name": name, "list": o["list"] or "Reminders"})
 
     return merged, actions
 
@@ -279,7 +312,7 @@ def fetch_reminders():
     return True, items
 
 
-def apply_actions(actions: dict, state_by_id: dict) -> None:
+def apply_actions(actions: dict) -> None:
     for item_id in actions.get("complete", []):
         _osa_set_completed(item_id, True)
     for item_id in actions.get("uncomplete", []):
@@ -333,11 +366,23 @@ def run_sync() -> None:
         lock.close()
 
 
+def _stamp_modified(merged: list, state_items: list, now: str) -> None:
+    """Give each merged item a `modified` time: keep the old one if unchanged,
+    else stamp `now`. Matched by id when available, otherwise by name."""
+    by_id = {i["id"]: i for i in state_items if i.get("id")}
+    by_name = {i["name"]: i for i in state_items}
+    for m in merged:
+        old = by_id.get(m.get("id")) or by_name.get(m["name"])
+        if old and old.get("completed") == m["completed"] and old.get("name") == m["name"]:
+            m["modified"] = old.get("modified", now)
+        else:
+            m["modified"] = now
+
+
 def _do_sync() -> None:
     logging.info("sync start")
 
     state = load_state(STATE_FILE)
-    state_by_id = {i["id"]: i for i in state["items"]}
 
     fetch_ok, reminders = fetch_reminders()
 
@@ -346,18 +391,7 @@ def _do_sync() -> None:
         logging.error("ABORT — %s. Leaving Obsidian file and state untouched.", reason)
         sys.exit(1)
 
-    # Preserve existing `modified` timestamps; stamp new items with now
     now = datetime.now().isoformat(timespec="seconds")
-    for r in reminders:
-        old = state_by_id.get(r["id"])
-        if old:
-            # Item changed → update modified; unchanged → keep old timestamp
-            if old["name"] != r["name"] or old["completed"] != r["completed"]:
-                r["modified"] = now
-            else:
-                r["modified"] = old.get("modified", now)
-        else:
-            r["modified"] = now
 
     obsidian_content = ""
     if os.path.exists(OBSIDIAN_FILE):
@@ -367,16 +401,16 @@ def _do_sync() -> None:
 
     merged, actions = compute_diff(state["items"], reminders, obsidian_sections)
 
-    apply_actions(actions, state_by_id)
+    apply_actions(actions)
 
-    # Re-fetch after applying actions so newly created reminders get their ids
+    # Re-fetch after applying actions so newly created/reopened reminders get
+    # their real ids, then recompute the merged view from the fresh data.
     if actions["complete"] or actions["uncomplete"] or actions["create"]:
         refetch_ok, refetched = fetch_reminders()
-        if refetch_ok and refetched:
-            merged = refetched
-        for r in merged:
-            old = state_by_id.get(r["id"])
-            r["modified"] = now if not old else old.get("modified", now)
+        if refetch_ok:
+            merged, _ = compute_diff(state["items"], refetched, obsidian_sections)
+
+    _stamp_modified(merged, state["items"], now)
 
     new_content = format_obsidian(merged)
     with open(OBSIDIAN_FILE, "w") as f:
