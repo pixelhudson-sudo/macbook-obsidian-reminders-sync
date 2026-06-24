@@ -18,15 +18,11 @@ No cloud service, no account, no API keys. Everything runs on your machine.
 # Work
 
 - [ ] Send the invoice
-
-# Completed
-
-- [x] Renew car insurance
 ```
 
-Each Apple Reminders list becomes a `#` section. Open items are sorted
-most-recently-changed first. Completed items collapse into a `# Completed`
-section at the bottom.
+Each Apple Reminders list becomes a `#` section, holding your open reminders
+sorted most-recently-changed first. Checking a box completes the reminder in
+Apple Reminders, after which it leaves the list on the next sync.
 
 ---
 
@@ -97,15 +93,25 @@ Each run it:
 |---|---|
 | New reminder in Apple Reminders | added to the Markdown file |
 | New `- [ ]` line in Markdown | reminder created in that list's section |
-| `- [ ]` → `- [x]` in Markdown | reminder completed in Apple Reminders |
+| `- [ ]` → `- [x]` in Markdown | reminder completed in Apple Reminders, then drops off the list |
 | `- [x]` → `- [ ]` in Markdown | reminder un-completed |
-| Reminder completed on your phone | moves to `# Completed` in Markdown |
-| Reminder deleted in Apple Reminders | removed from Markdown |
+| Reminder completed or deleted elsewhere | drops off the list in Markdown |
 
 4. Writes the merged result back to the Markdown file and saves the new snapshot.
 
 Items are matched between the two sides by **name**, and tracked across runs by
 their Apple Reminders id.
+
+The file holds your **incomplete** reminders. Anything completed (in Obsidian
+or on your phone) simply leaves the list — *done = off the list*. This is a
+deliberate choice: querying completed reminders over iCloud via AppleScript
+takes minutes, so the sync stays fast by only reading open items.
+
+### Only one sync at a time
+
+A run can take 15-60s (iCloud). A file lock ensures a scheduled run that lands
+while another is still going **backs off** instead of running concurrently and
+corrupting state.
 
 ### Safety guard
 
@@ -155,7 +161,9 @@ headless and reliably. This is the whole reason the project exists in this shape
   same context can be ambiguous.
 - Notes, due dates, priorities, sub-tasks and tags are **not** synced — titles
   and completion state only.
-- iCloud latency makes each sync take a while; this is not real-time.
+- Only **open** reminders are synced. Completed ones leave the file; there is no
+  `# Completed` archive (querying completed items over iCloud is far too slow).
+- iCloud latency makes each sync take a while (15-60s); this is not real-time.
 - Reminders typed in Markdown are created in a list named after their `#`
   section — that list must already exist in Apple Reminders.
 

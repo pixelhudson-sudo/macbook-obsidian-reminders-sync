@@ -10,6 +10,7 @@ from sync import (
     load_state,
     save_state,
     should_abort,
+    acquire_lock,
 )
 import json, os, tempfile
 
@@ -215,3 +216,32 @@ def test_proceed_when_items_present():
     items = [{"id": "r1", "name": "Task", "list": "Reminders", "completed": False, "modified": "x"}]
     abort, _ = should_abort(fetch_ok=True, fetched_items=items, state_items=[])
     assert abort is False
+
+
+# ---------------------------------------------------------------------------
+# acquire_lock — prevent overlapping runs
+#
+# WHY: osascript reads are slow (15-50s); a manual run can overlap a scheduled
+# launchd run. Two instances writing the same file/state and both driving
+# Reminders.app concurrently corrupt state and grind to a halt. Only one sync
+# may run at a time; later starters must back off.
+# ---------------------------------------------------------------------------
+
+def test_lock_blocks_second_holder():
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "sync.lock")
+        first = acquire_lock(path)
+        assert first is not None, "first acquisition should succeed"
+        second = acquire_lock(path)
+        assert second is None, "second acquisition must fail while first holds it"
+        first.close()
+
+def test_lock_reacquirable_after_release():
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "sync.lock")
+        a = acquire_lock(path)
+        assert a is not None
+        a.close()
+        b = acquire_lock(path)
+        assert b is not None, "lock should be free after the holder closes it"
+        b.close()

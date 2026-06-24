@@ -13,6 +13,7 @@ install.sh generates):
 
 Run it directly to sync once. See README.md for scheduling with launchd.
 """
+import fcntl
 import json
 import logging
 import os
@@ -31,6 +32,7 @@ LOG_FILE = (
     or os.path.expanduser("~/Library/Logs/obsidian-reminders-sync.log")
 )
 OSA_TIMEOUT = int(os.environ.get("OBSIDIAN_SYNC_TIMEOUT", "120"))
+LOCK_FILE = STATE_FILE + ".lock"
 
 os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
@@ -99,6 +101,26 @@ def format_obsidian(reminders: list) -> str:
         lines.append("")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Single-instance lock (prevents overlapping runs)
+# ---------------------------------------------------------------------------
+
+def acquire_lock(path: str):
+    """
+    Try to take an exclusive, non-blocking lock.
+    Returns an open file handle holding the lock, or None if another process
+    already holds it. The lock releases automatically when the handle is closed
+    or the process exits. Caller must keep the handle alive for the run.
+    """
+    f = open(path, "w")
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return f
+    except (BlockingIOError, OSError):
+        f.close()
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -227,19 +249,15 @@ def _osa(script: str):
     )
 
 
-def fetch_reminders(state_items=None):
+def fetch_reminders():
     """
-    Read reminders via osascript → Reminders.app.
+    Read all INCOMPLETE reminders via osascript → Reminders.app in one bulk query.
     Returns (ok, items): ok=False if osascript errored.
 
-    Strategy: bulk-fetch all INCOMPLETE reminders in one query. For items we were
-    tracking that are no longer incomplete, check each by id — if it still exists
-    and is completed, include it as completed (reusing its known name/list); if it
-    no longer exists, it was deleted and is dropped.
+    We deliberately do NOT query completed reminders: filtering/looking those up
+    over iCloud via AppleScript takes minutes. An item that is completed or deleted
+    elsewhere simply drops off the incomplete list (and out of the Markdown file).
     """
-    if state_items is None:
-        state_items = []
-
     r = _osa(_FETCH_INCOMPLETE)
     if r.returncode != 0:
         logging.error("osascript fetch failed (rc=%s): %s", r.returncode, r.stderr.strip())
@@ -247,7 +265,6 @@ def fetch_reminders(state_items=None):
 
     now = datetime.now().isoformat(timespec="seconds")
     items = []
-    seen = set()
     for line in r.stdout.splitlines():
         line = line.strip()
         if not line:
@@ -257,23 +274,8 @@ def fetch_reminders(state_items=None):
             continue
         rid, ln, name = parts
         items.append({"id": rid, "name": name, "list": ln, "completed": False, "modified": now})
-        seen.add(rid)
 
     logging.info("osascript returned %d incomplete items", len(items))
-
-    # Detect completion/deletion for tracked items missing from the incomplete set
-    for s in state_items:
-        sid = s["id"]
-        if sid in seen:
-            continue
-        chk = _osa(f'tell application "Reminders" to return completed of reminder id "{sid}"')
-        if chk.returncode == 0 and chk.stdout.strip() == "true":
-            items.append({
-                "id": sid, "name": s["name"], "list": s["list"],
-                "completed": True, "modified": now,
-            })
-        # rc != 0 → reminder no longer exists → deleted → drop
-
     return True, items
 
 
@@ -320,12 +322,24 @@ def run_sync() -> None:
         sys.stderr.write(f"ERROR: folder does not exist: {parent}\n")
         sys.exit(2)
 
+    lock = acquire_lock(LOCK_FILE)
+    if lock is None:
+        logging.info("another sync is already running — skipping this cycle")
+        return
+
+    try:
+        _do_sync()
+    finally:
+        lock.close()
+
+
+def _do_sync() -> None:
     logging.info("sync start")
 
     state = load_state(STATE_FILE)
     state_by_id = {i["id"]: i for i in state["items"]}
 
-    fetch_ok, reminders = fetch_reminders(state["items"])
+    fetch_ok, reminders = fetch_reminders()
 
     abort, reason = should_abort(fetch_ok, reminders, state["items"])
     if abort:
@@ -355,10 +369,9 @@ def run_sync() -> None:
 
     apply_actions(actions, state_by_id)
 
-    # Re-fetch after applying actions to get fresh state
+    # Re-fetch after applying actions so newly created reminders get their ids
     if actions["complete"] or actions["uncomplete"] or actions["create"]:
-        known = list({i["id"]: i for i in (state["items"] + merged)}.values())
-        refetch_ok, refetched = fetch_reminders(known)
+        refetch_ok, refetched = fetch_reminders()
         if refetch_ok and refetched:
             merged = refetched
         for r in merged:
